@@ -29,6 +29,7 @@ import Editor from "@monaco-editor/react";
 import type { editor } from "monaco-editor/esm/vs/editor/editor.api";
 import animals from "../lib/animals.json";
 import Rustpad, { UserInfo } from "../lib/rustpad";
+import LiveAgent, { LiveAgentState } from "../lib/liveAgent";
 import ConnectionStatus from "../components/ConnectionStatus";
 import Footer from "../components/Footer";
 import User from "../components/User";
@@ -68,6 +69,9 @@ function EditorPage() {
   const [darkMode, setDarkMode] = useStorage("darkMode", () => false);
   const rustpad = useRef<Rustpad>();
   const { id } = useParams<string>();
+  const [voiceState, setVoiceState] = useState<LiveAgentState>("idle");
+  const liveAgent = useRef<LiveAgent>();
+  const audioRef = useRef<HTMLAudioElement>(null);
 
   useEffect(() => {
     if (editor?.getModel()) {
@@ -134,6 +138,49 @@ function EditorPage() {
         () => null
       );
       editor.setPosition({ column: 0, lineNumber: 0 });
+    }
+  }
+
+  useEffect(() => {
+    return () => {
+      liveAgent.current?.stop();
+    };
+  }, []);
+
+  async function handleToggleVoice() {
+    if (!editor || !audioRef.current) return;
+
+    if (voiceState === "live" || voiceState === "connecting") {
+      await liveAgent.current?.stop();
+      return;
+    }
+
+    if (!liveAgent.current) {
+      liveAgent.current = new LiveAgent(editor, audioRef.current, {
+        onStateChange: setVoiceState,
+        onError: (message) =>
+          toast({
+            title: "Voice co-producer error",
+            description: message,
+            status: "error",
+            duration: 5000,
+            isClosable: true,
+          }),
+        onSummary: (summary) =>
+          toast({
+            title: "Co-producer",
+            description: summary,
+            status: "info",
+            duration: 4000,
+            isClosable: true,
+          }),
+      });
+    }
+
+    try {
+      await liveAgent.current!.start();
+    } catch {
+      // Error state and toast are already reported via the callbacks above.
     }
   }
 
@@ -249,6 +296,46 @@ function EditorPage() {
             </Link>{" "}
             for details.
           </Text>
+
+          <Heading mt={4} mb={1.5} size="sm">
+            Voice Co-Producer
+          </Heading>
+          <Text fontSize="sm" mb={1.5}>
+            Talk to an AI co-producer and it will edit this score live, for
+            everyone connected.
+          </Text>
+          <Button
+            size="sm"
+            colorScheme={
+              voiceState === "live"
+                ? "green"
+                : voiceState === "error"
+                ? "red"
+                : darkMode
+                ? "whiteAlpha"
+                : "blackAlpha"
+            }
+            borderColor={darkMode ? "purple.400" : "purple.600"}
+            color={
+              voiceState === "live" || voiceState === "error"
+                ? undefined
+                : darkMode
+                ? "purple.400"
+                : "purple.600"
+            }
+            variant={voiceState === "live" ? "solid" : "outline"}
+            isLoading={voiceState === "connecting" || voiceState === "closing"}
+            loadingText={voiceState === "connecting" ? "Connecting" : "Ending"}
+            isDisabled={!editor}
+            onClick={handleToggleVoice}
+          >
+            {voiceState === "live"
+              ? "Stop Voice Co-Producer"
+              : voiceState === "error"
+              ? "Retry Voice Co-Producer"
+              : "Start Voice Co-Producer"}
+          </Button>
+          <audio ref={audioRef} autoPlay hidden />
 
           <Button
             size="sm"

@@ -14,6 +14,7 @@ use warp::{filters::BoxedFilter, ws::Ws, Filter, Reply};
 
 use rustpad::Rustpad;
 
+mod live_session;
 mod ot;
 mod rustpad;
 
@@ -121,7 +122,7 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
             })
         });
 
-    socket.or(text).or(stats).boxed()
+    socket.or(text).or(stats).or(live_session::route()).boxed()
 }
 
 const HOUR: Duration = Duration::from_secs(3600);
