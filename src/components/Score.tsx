@@ -141,6 +141,13 @@ function Score({ notes, darkMode }: ScoreProps) {
     } catch (error) {
       console.warn("Error when running Abcjs:", error);
     }
+
+    // The controller schedules its audio on a module-level AudioContext that
+    // abcjs shares across instances, so removing the DOM does not silence a
+    // playing tune. Without this, a score replaced mid-playback keeps sounding
+    // over its replacement.
+    const controller = ref.current.synthControl;
+    return () => controller.destroy();
   }, [notes]);
 
   return (

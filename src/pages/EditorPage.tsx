@@ -387,7 +387,7 @@ function EditorPage() {
               </Box>
 
               <Box overflowX="auto">
-                <Score notes={abcString} darkMode={darkMode} />
+                <Score key={abcString} notes={abcString} darkMode={darkMode} />
               </Box>
             </Split>
           </Box>
