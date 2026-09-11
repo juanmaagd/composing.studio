@@ -16,11 +16,11 @@ console_error_panic_hook = { version = "0.1", optional = true }
 operational-transform = { version = "0.6.0", features = ["serde"] }
 serde = { version = "1.0.126", features = ["derive"] }
 serde_json = "1.0.64"
-wasm-bindgen = "0.2"
-js-sys = "0.3.51"
+wasm-bindgen = "0.2.100"
+js-sys = "0.3.77"
 
 [dev-dependencies]
-wasm-bindgen-test = "0.3"
+wasm-bindgen-test = "0.3.50"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false
