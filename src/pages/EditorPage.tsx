@@ -29,7 +29,8 @@ import Editor from "@monaco-editor/react";
 import type { editor } from "monaco-editor/esm/vs/editor/editor.api";
 import animals from "../lib/animals.json";
 import Rustpad, { UserInfo } from "../lib/rustpad";
-import LiveAgent, { LiveAgentState } from "../lib/liveAgent";
+import LiveAgent, { LiveAgentState, LiveAgentActivity } from "../lib/liveAgent";
+import VoiceDock from "../components/VoiceDock";
 import ConnectionStatus from "../components/ConnectionStatus";
 import Footer from "../components/Footer";
 import User from "../components/User";
@@ -59,6 +60,7 @@ function generateHue() {
 
 function EditorPage() {
   const toast = useToast();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [connection, setConnection] = useState<
     "connected" | "disconnected" | "desynchronized"
   >("disconnected");
@@ -70,6 +72,10 @@ function EditorPage() {
   const rustpad = useRef<Rustpad>();
   const { id } = useParams<string>();
   const [voiceState, setVoiceState] = useState<LiveAgentState>("idle");
+  const [voiceActivity, setVoiceActivity] =
+    useState<LiveAgentActivity>("listening");
+  const [voiceMuted, setVoiceMuted] = useState(false);
+  const [voiceError, setVoiceError] = useState("");
   const liveAgent = useRef<LiveAgent>();
   const audioRef = useRef<HTMLAudioElement>(null);
 
@@ -143,9 +149,10 @@ function EditorPage() {
 
   useEffect(() => {
     return () => {
-      liveAgent.current?.stop();
+      void liveAgent.current?.stop();
+      liveAgent.current = undefined;
     };
-  }, []);
+  }, [editor, id]);
 
   async function handleToggleVoice() {
     if (!editor || !audioRef.current) return;
@@ -155,17 +162,13 @@ function EditorPage() {
       return;
     }
 
+    setVoiceError("");
     if (!liveAgent.current) {
       liveAgent.current = new LiveAgent(editor, audioRef.current, {
         onStateChange: setVoiceState,
-        onError: (message) =>
-          toast({
-            title: "Voice co-producer error",
-            description: message,
-            status: "error",
-            duration: 5000,
-            isClosable: true,
-          }),
+        onActivityChange: setVoiceActivity,
+        onMutedChange: setVoiceMuted,
+        onError: setVoiceError,
         onSummary: (summary) =>
           toast({
             title: "Co-producer",
@@ -204,11 +207,30 @@ function EditorPage() {
         fontSize="sm"
         py={0.5}
       >
+        <Button
+          display={{ base: "inline-flex", md: "none" }}
+          size="xs"
+          variant="ghost"
+          aria-expanded={sidebarOpen}
+          aria-controls="studio-sidebar"
+          onClick={() => setSidebarOpen(!sidebarOpen)}
+          mr={2}
+        >
+          {sidebarOpen ? "Close settings" : "Studio settings"}
+        </Button>
         Composing Studio
       </Box>
       <Flex flex="1 0" minH={0}>
         <Container
           w="xs"
+          id="studio-sidebar"
+          display={{ base: sidebarOpen ? "block" : "none", md: "block" }}
+          position={{ base: "absolute", md: "static" }}
+          top="32px"
+          bottom="22px"
+          zIndex={30}
+          boxShadow={{ base: "0 8px 32px rgba(25, 16, 40, 0.2)", md: "none" }}
+          flexShrink={0}
           bgColor={darkMode ? "#252526" : "#f3f3f3"}
           overflowY="auto"
           maxW="full"
@@ -297,46 +319,6 @@ function EditorPage() {
             for details.
           </Text>
 
-          <Heading mt={4} mb={1.5} size="sm">
-            Voice Co-Producer
-          </Heading>
-          <Text fontSize="sm" mb={1.5}>
-            Talk to an AI co-producer and it will edit this score live, for
-            everyone connected.
-          </Text>
-          <Button
-            size="sm"
-            colorScheme={
-              voiceState === "live"
-                ? "green"
-                : voiceState === "error"
-                ? "red"
-                : darkMode
-                ? "whiteAlpha"
-                : "blackAlpha"
-            }
-            borderColor={darkMode ? "purple.400" : "purple.600"}
-            color={
-              voiceState === "live" || voiceState === "error"
-                ? undefined
-                : darkMode
-                ? "purple.400"
-                : "purple.600"
-            }
-            variant={voiceState === "live" ? "solid" : "outline"}
-            isLoading={voiceState === "connecting" || voiceState === "closing"}
-            loadingText={voiceState === "connecting" ? "Connecting" : "Ending"}
-            isDisabled={!editor}
-            onClick={handleToggleVoice}
-          >
-            {voiceState === "live"
-              ? "Stop Voice Co-Producer"
-              : voiceState === "error"
-              ? "Retry Voice Co-Producer"
-              : "Start Voice Co-Producer"}
-          </Button>
-          <audio ref={audioRef} autoPlay hidden />
-
           <Button
             size="sm"
             colorScheme={darkMode ? "whiteAlpha" : "blackAlpha"}
@@ -350,7 +332,15 @@ function EditorPage() {
             Load an example
           </Button>
         </Container>
-        <Flex flex={1} minW={0} h="100%" direction="column" overflow="hidden">
+        <Flex
+          flex={1}
+          minW={0}
+          h="100%"
+          direction="column"
+          overflow="hidden"
+          position="relative"
+          pb={{ base: "180px", md: "130px" }}
+        >
           <HStack
             h={6}
             spacing={1}
@@ -391,6 +381,17 @@ function EditorPage() {
               </Box>
             </Split>
           </Box>
+          <VoiceDock
+            state={voiceState}
+            activity={voiceActivity}
+            muted={voiceMuted}
+            error={voiceError}
+            ready={!!editor}
+            darkMode={darkMode}
+            onToggle={handleToggleVoice}
+            onMute={() => liveAgent.current?.setMuted(!voiceMuted)}
+          />
+          <audio ref={audioRef} autoPlay hidden />
         </Flex>
       </Flex>
       <Footer />

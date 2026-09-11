@@ -8,9 +8,17 @@ export type LiveAgentState =
   | "closing"
   | "error";
 
+export type LiveAgentActivity =
+  | "listening"
+  | "thinking"
+  | "responding"
+  | "working";
+
 /** Callbacks used to report state, errors, and tool activity to the UI. */
 export type LiveAgentCallbacks = {
   readonly onStateChange?: (state: LiveAgentState) => unknown;
+  readonly onActivityChange?: (activity: LiveAgentActivity) => unknown;
+  readonly onMutedChange?: (muted: boolean) => unknown;
   readonly onError?: (message: string) => unknown;
   readonly onSummary?: (summary: string) => unknown;
 };
@@ -24,7 +32,6 @@ const DATA_CHANNEL_LABEL = "oai-events";
 const MICROPHONE_TIMEOUT_MS = 15_000;
 const SCORE_CONTEXT_DEBOUNCE_MS = 400;
 const ICE_GATHERING_TIMEOUT_MS = 10_000;
-const SESSION_CLOSE_TIMEOUT_MS = 5_000;
 
 let eventIdCounter = 0;
 
@@ -62,6 +69,66 @@ export default class LiveAgent {
   private scoreContextTimer?: ReturnType<typeof setTimeout>;
   private scoreChangeHandle?: { dispose(): void };
   private localStream?: MediaStream;
+  private generation = 0;
+  private abort?: AbortController;
+  private connectionTimer?: ReturnType<typeof setTimeout>;
+  private microphoneTimer?: ReturnType<typeof setTimeout>;
+  private audioTimer?: ReturnType<typeof setInterval>;
+  private audioContext?: AudioContext;
+  private thinking = false;
+  private speaking = false;
+  private muted = false;
+
+  setMuted(muted: boolean) {
+    this.muted = muted;
+    this.localStream?.getAudioTracks().forEach((track) => {
+      track.enabled = !muted;
+    });
+    this.callbacks.onMutedChange?.(muted);
+  }
+
+  private reportActivity() {
+    this.callbacks.onActivityChange?.(
+      this.speaking ? "responding" : this.thinking ? "thinking" : "listening"
+    );
+  }
+
+  private fail(message: string) {
+    if (
+      this.state === "idle" ||
+      this.state === "closing" ||
+      this.state === "error"
+    )
+      return;
+    this.generation += 1;
+    this.setState("error");
+    void this.teardown();
+    this.callbacks.onError?.(message);
+  }
+
+  // Measure received audio, not generated transcript timing: WebRTC playback can
+  // continue after a delegated response completes.
+  private monitorOutput(stream: MediaStream) {
+    const context = this.audioContext;
+    if (!context) return;
+    const source = context.createMediaStreamSource(stream);
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+    const samples = new Uint8Array(analyser.fftSize);
+    let lastSound = 0;
+    clearInterval(this.audioTimer);
+    this.audioTimer = setInterval(() => {
+      analyser.getByteTimeDomainData(samples);
+      const audible = samples.some((value) => Math.abs(value - 128) > 3);
+      if (audible) lastSound = Date.now();
+      const speaking = lastSound > 0 && Date.now() - lastSound < 600;
+      if (speaking !== this.speaking) {
+        this.speaking = speaking;
+        this.reportActivity();
+      }
+    }, 100);
+  }
 
   constructor(
     editorInstance: editor.IStandaloneCodeEditor,
@@ -87,36 +154,79 @@ export default class LiveAgent {
     if (this.state === "connecting" || this.state === "live") {
       return;
     }
+    const generation = ++this.generation;
+    const current = () => generation === this.generation;
     this.setState("connecting");
-    trace("start() called");
+    this.setMuted(false);
+    this.thinking = false;
+    this.speaking = false;
+    this.reportActivity();
+    this.abort = new AbortController();
+    this.connectionTimer = setTimeout(
+      () =>
+        this.fail(
+          "Voice connection timed out. Check your connection and retry."
+        ),
+      30_000
+    );
 
     try {
-      trace("requesting microphone...");
-      // getUserMedia never settles when the permission prompt is dismissed
-      // rather than answered, which looks exactly like a frozen button. Fail
-      // loudly instead so the cause is visible.
-      this.localStream = await Promise.race([
-        navigator.mediaDevices.getUserMedia({ audio: true }),
-        new Promise<never>((_, reject) =>
-          setTimeout(
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error(
+          "Microphone access requires HTTPS or localhost and a supported browser."
+        );
+      }
+      this.audioContext = new AudioContext();
+      void this.audioContext.resume().catch(() => {});
+      const microphone = navigator.mediaDevices.getUserMedia({ audio: true });
+      // A permission prompt may resolve after cancellation/timeout. Always
+      // release that late stream instead of leaving the microphone recording.
+      microphone.then(
+        (stream) => {
+          if (!current()) stream.getTracks().forEach((track) => track.stop());
+        },
+        () => {}
+      );
+      const stream = await Promise.race([
+        microphone,
+        new Promise<never>((_, reject) => {
+          this.microphoneTimer = setTimeout(
             () =>
               reject(
                 new Error(
-                  "Microphone permission was never granted. Check the microphone " +
-                    "icon in the address bar, and confirm the browser has microphone " +
-                    "access in your operating system's privacy settings."
+                  "Microphone permission was not granted. Allow microphone access in your browser and retry."
                 )
               ),
             MICROPHONE_TIMEOUT_MS
-          )
-        ),
+          );
+        }),
       ]);
-      trace("microphone granted", this.localStream.getAudioTracks().map((t) => t.label));
+      if (!current()) return;
+      clearTimeout(this.microphoneTimer);
+      this.localStream = stream;
+      for (const track of stream.getAudioTracks()) {
+        track.onended = () => {
+          if (current())
+            this.fail("Microphone disconnected. Reconnect it and retry voice.");
+        };
+      }
 
       const pc = new RTCPeerConnection();
       this.pc = pc;
-      pc.addEventListener("connectionstatechange", () => trace("pc.connectionState", pc.connectionState));
-      pc.addEventListener("iceconnectionstatechange", () => trace("pc.iceConnectionState", pc.iceConnectionState));
+      pc.addEventListener("connectionstatechange", () => {
+        if (
+          current() &&
+          (pc.connectionState === "failed" ||
+            pc.connectionState === "disconnected")
+        ) {
+          this.fail(
+            "Voice connection interrupted. Check your network and retry."
+          );
+        }
+      });
+      pc.addEventListener("iceconnectionstatechange", () =>
+        trace("pc.iceConnectionState", pc.iceConnectionState)
+      );
 
       for (const track of this.localStream.getTracks()) {
         pc.addTrack(track, this.localStream);
@@ -124,8 +234,15 @@ export default class LiveAgent {
 
       pc.ontrack = (event) => {
         const [stream] = event.streams;
-        if (stream) {
+        if (stream && current()) {
+          this.monitorOutput(stream);
           this.audioEl.srcObject = stream;
+          void this.audioEl.play().catch(() => {
+            if (current())
+              this.fail(
+                "Audio playback was blocked. Retry voice to enable playback."
+              );
+          });
         }
       };
 
@@ -137,9 +254,11 @@ export default class LiveAgent {
 
       trace("creating offer");
       const offer = await pc.createOffer();
+      if (!current()) return;
       await pc.setLocalDescription(offer);
       trace("waiting for ICE gathering");
       await this.waitForIceGatheringComplete(pc);
+      if (!current()) return;
       trace("ICE gathering done", pc.iceGatheringState);
 
       const localSdp = pc.localDescription?.sdp;
@@ -149,6 +268,7 @@ export default class LiveAgent {
 
       trace("POST /api/live-session", `sdp ${localSdp.length} bytes`);
       const response = await fetch("/api/live-session", {
+        signal: this.abort?.signal,
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sdp: localSdp }),
@@ -163,22 +283,23 @@ export default class LiveAgent {
 
       trace("session created, HTTP " + response.status);
       const result = await response.json();
+      if (!current()) return;
       const answerSdp = result?.transport?.sdp;
       if (!answerSdp) {
         throw new Error("Live session response is missing transport.sdp");
       }
 
       await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
-      trace("remote description applied -- now waiting for session.started on the data channel");
+      trace(
+        "remote description applied -- now waiting for session.started on the data channel"
+      );
 
       // Do NOT send session.start: the HTTP request above already started
       // the session. State flips to "live" once session.started arrives.
     } catch (err) {
+      if (!current()) return;
       const message = err instanceof Error ? err.message : String(err);
-      trace("FAILED", message);
-      this.setState("error");
-      this.callbacks.onError?.(message);
-      await this.teardown();
+      this.fail(message);
       throw err;
     }
   }
@@ -188,14 +309,17 @@ export default class LiveAgent {
     if (this.state === "idle") {
       return;
     }
+    this.generation += 1;
     this.setState("closing");
 
-    if (this.dc && this.dc.readyState === "open") {
-      const closed = this.waitForSessionClosed();
-      this.dc.send(JSON.stringify({ type: "session.close" }));
-      await closed;
+    // Release microphone immediately; session.close is best effort and must
+    // never keep local recording alive while waiting for an acknowledgement.
+    try {
+      if (this.dc?.readyState === "open")
+        this.dc.send(JSON.stringify({ type: "session.close" }));
+    } catch {
+      /* The peer may already have disconnected. */
     }
-
     await this.teardown();
     this.setState("idle");
   }
@@ -220,29 +344,6 @@ export default class LiveAgent {
       };
       pc.addEventListener("icegatheringstatechange", onChange);
       const timer = setTimeout(finish, ICE_GATHERING_TIMEOUT_MS);
-    });
-  }
-
-  private waitForSessionClosed(
-    timeoutMs = SESSION_CLOSE_TIMEOUT_MS
-  ): Promise<void> {
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        this.dc?.removeEventListener("message", onMessage);
-        clearTimeout(timer);
-        resolve();
-      };
-      const onMessage = (event: MessageEvent) => {
-        const message = this.parseMessage(event.data);
-        if (message?.type === "session.closed") {
-          finish();
-        }
-      };
-      this.dc?.addEventListener("message", onMessage);
-      const timer = setTimeout(finish, timeoutMs);
     });
   }
 
@@ -292,23 +393,30 @@ export default class LiveAgent {
     dc.addEventListener("message", (event) => {
       try {
         const parsed = JSON.parse(event.data);
-        trace("<- " + parsed.type, parsed.type === "error" ? parsed : undefined);
+        trace(
+          "<- " + parsed.type,
+          parsed.type === "error" ? parsed : undefined
+        );
       } catch {
         trace("<- unparseable data channel message", event.data);
       }
-      this.handleDataChannelMessage(event.data);
+      if (this.dc === dc && this.state !== "closing" && this.state !== "error")
+        this.handleDataChannelMessage(event.data);
     });
 
     dc.addEventListener("close", () => {
       trace("data channel CLOSED");
-      if (this.state === "live" || this.state === "connecting") {
-        this.setState("idle");
+      if (
+        this.dc === dc &&
+        (this.state === "live" || this.state === "connecting")
+      ) {
+        this.fail("Voice connection closed unexpectedly. Retry to reconnect.");
       }
     });
 
     dc.addEventListener("error", () => {
-      this.setState("error");
-      this.callbacks.onError?.("GPT-Live data channel error");
+      if (this.dc === dc)
+        this.fail("Voice data connection failed. Retry to reconnect.");
     });
   }
 
@@ -331,6 +439,7 @@ export default class LiveAgent {
 
     switch (message.type) {
       case "session.started":
+        clearTimeout(this.connectionTimer);
         // Seed the backend with the score as soon as the session is usable,
         // and keep it in sync as the document changes.
         setTimeout(() => this.sendScoreContext(), 0);
@@ -342,12 +451,15 @@ export default class LiveAgent {
         this.setState("live");
         return;
       case "session.closed":
-        this.setState("idle");
+        this.fail("Voice session ended. Retry to reconnect.");
+        return;
+      case "session.delegation.created":
+        this.thinking = true;
+        this.reportActivity();
         return;
       case "error":
-        this.setState("error");
-        this.callbacks.onError?.(
-          message.error?.message ?? "GPT-Live session error"
+        this.fail(
+          message.error?.message ?? "Voice session failed. Retry to reconnect."
         );
         return;
       case "response.event":
@@ -361,7 +473,38 @@ export default class LiveAgent {
   }
 
   private handleDelegatedEvent(event: any) {
-    if (!event || event.type !== "response.output_item.done") {
+    if (!event) return;
+    if (
+      event.type === "response.created" ||
+      event.type === "response.in_progress"
+    ) {
+      this.thinking = true;
+      this.reportActivity();
+    }
+    if (
+      event.type === "response.completed" ||
+      event.type === "response.cancelled"
+    ) {
+      this.thinking = false;
+      this.reportActivity();
+    }
+    if (
+      event.type === "response.failed" ||
+      event.type === "response.incomplete"
+    ) {
+      this.fail(
+        event.response?.error?.message ??
+          "The co-producer could not finish. Retry voice and try a smaller request."
+      );
+      return;
+    }
+    if (
+      event.type === "response.output_item.added" &&
+      event.item?.type === "function_call"
+    ) {
+      this.callbacks.onActivityChange?.("working");
+    }
+    if (event.type !== "response.output_item.done") {
       // Forwarded lifecycle snapshots (including response.completed) carry
       // an empty response.output — function calls are read exclusively
       // from response.output_item.done, never inferred from that snapshot.
@@ -375,6 +518,7 @@ export default class LiveAgent {
   }
 
   private executeFunctionCall(callId: string, name: string, rawArgs: string) {
+    this.callbacks.onActivityChange?.("working");
     let output: string;
     try {
       if (name === "replace_score") {
@@ -399,7 +543,9 @@ export default class LiveAgent {
   private applyReplaceScore(args: ReplaceScoreArgs) {
     const model = this.editor.getModel();
     if (!model || typeof args.abc !== "string") {
-      return;
+      throw new Error(
+        "Cannot apply score: the editor or ABC notation is unavailable."
+      );
     }
     this.editor.executeEdits("voice-agent", [
       {
@@ -441,6 +587,17 @@ export default class LiveAgent {
   }
 
   private async teardown() {
+    this.abort?.abort();
+    this.abort = undefined;
+    clearTimeout(this.connectionTimer);
+    clearTimeout(this.microphoneTimer);
+    clearInterval(this.audioTimer);
+    void this.audioContext?.close().catch(() => {});
+    this.audioContext = undefined;
+    this.thinking = false;
+    this.speaking = false;
+    this.setMuted(false);
+    this.reportActivity();
     if (this.scoreContextTimer !== undefined) {
       clearTimeout(this.scoreContextTimer);
       this.scoreContextTimer = undefined;
@@ -449,8 +606,9 @@ export default class LiveAgent {
     this.scoreChangeHandle = undefined;
 
     if (this.dc) {
-      this.dc.close();
+      const dc = this.dc;
       this.dc = undefined;
+      dc.close();
     }
     if (this.pc) {
       for (const sender of this.pc.getSenders()) {
