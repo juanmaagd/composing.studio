@@ -91,20 +91,6 @@ function Score({ notes, darkMode }: ScoreProps) {
   }
 
   useEffect(() => {
-    ref.current.synthControl.load(
-      `#audio-${ref.current.id}`,
-      ref.current.cursorControl,
-      {
-        displayLoop: true,
-        displayRestart: true,
-        displayPlay: true,
-        displayProgress: true,
-        displayWarp: true,
-      }
-    );
-  }, []);
-
-  useEffect(() => {
     try {
       let visualObj = abcjs.renderAbc(`paper-${ref.current.id}`, notes, {
         responsive: "resize",
@@ -112,6 +98,24 @@ function Score({ notes, darkMode }: ScoreProps) {
       });
 
       const generation = ++renderGeneration.current;
+
+      // Re-mount the controller on every tune. setTune alone updates the
+      // controller's state but leaves the rendered transport bound to the
+      // previously loaded tune, which is why a reload was needed to hear a
+      // new score. Running load() first reproduces the fresh-mount path that
+      // always worked.
+      ref.current.synthControl.load(
+        `#audio-${ref.current.id}`,
+        ref.current.cursorControl,
+        {
+          displayLoop: true,
+          displayRestart: true,
+          displayPlay: true,
+          displayProgress: true,
+          displayWarp: true,
+        }
+      );
+
       ref.current.synth
         .init({ visualObj: visualObj[0] })
         .then(function () {
