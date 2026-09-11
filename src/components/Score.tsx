@@ -79,6 +79,7 @@ type ScoreProps = {
 
 function Score({ notes, darkMode }: ScoreProps) {
   const ref = useRef<any>(null);
+  const renderGeneration = useRef(0);
   if (ref.current === null) {
     const id = nanoid();
     ref.current = {
@@ -110,21 +111,29 @@ function Score({ notes, darkMode }: ScoreProps) {
         add_classes: true,
       });
 
+      const generation = ++renderGeneration.current;
       ref.current.synth
         .init({ visualObj: visualObj[0] })
         .then(function () {
-          ref.current.synthControl
+          // A later edit may have landed while this was loading. Dropping the
+          // stale one keeps the player on the newest tune instead of whichever
+          // async chain happened to finish last.
+          if (generation !== renderGeneration.current) return;
+          return ref.current.synthControl
             .setTune(visualObj[0], false, { chordsOff: false })
             .then(function () {
-              console.log("Audio successfully loaded.");
-            })
-            .catch(function (error: any) {
-              console.warn("Audio problem:", error);
+              if (generation !== renderGeneration.current) return;
+              // Log the title so a stale player is visible instead of silent.
+              console.log(
+                "Audio loaded:",
+                visualObj[0].metaText?.title ?? "(untitled)"
+              );
             });
         })
         .catch(function (error: any) {
           console.warn("Audio problem:", error);
         });
+
     } catch (error) {
       console.warn("Error when running Abcjs:", error);
     }

@@ -80,6 +80,7 @@ pub fn route() -> BoxedFilter<(impl Reply,)> {
 }
 
 async fn handle_live_session(req: LiveSessionRequest) -> Result<impl Reply, Rejection> {
+    log::info!("live-session: request received");
     let api_key = match std::env::var("OPENAI_API_KEY") {
         Ok(key) if !key.trim().is_empty() => key,
         _ => {

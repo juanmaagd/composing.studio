@@ -21,6 +21,8 @@ type ReplaceScoreArgs = {
 };
 
 const DATA_CHANNEL_LABEL = "oai-events";
+const MICROPHONE_TIMEOUT_MS = 15_000;
+const SCORE_CONTEXT_DEBOUNCE_MS = 400;
 const ICE_GATHERING_TIMEOUT_MS = 10_000;
 const SESSION_CLOSE_TIMEOUT_MS = 5_000;
 
@@ -41,6 +43,14 @@ function nextEventId(): string {
  * applied here via `editor.executeEdits` propagates to every collaborator
  * exactly like a normal keystroke.
  */
+const t0 = Date.now();
+/** Timestamped tracing for the connection sequence. Visible in the browser console. */
+function trace(step: string, detail?: unknown) {
+  const ms = String(Date.now() - t0).padStart(6);
+  if (detail === undefined) console.log(`[live ${ms}ms] ${step}`);
+  else console.log(`[live ${ms}ms] ${step}`, detail);
+}
+
 export default class LiveAgent {
   private readonly editor: editor.IStandaloneCodeEditor;
   private readonly audioEl: HTMLAudioElement;
@@ -49,6 +59,8 @@ export default class LiveAgent {
   private state: LiveAgentState = "idle";
   private pc?: RTCPeerConnection;
   private dc?: RTCDataChannel;
+  private scoreContextTimer?: ReturnType<typeof setTimeout>;
+  private scoreChangeHandle?: { dispose(): void };
   private localStream?: MediaStream;
 
   constructor(
@@ -76,14 +88,35 @@ export default class LiveAgent {
       return;
     }
     this.setState("connecting");
+    trace("start() called");
 
     try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-      });
+      trace("requesting microphone...");
+      // getUserMedia never settles when the permission prompt is dismissed
+      // rather than answered, which looks exactly like a frozen button. Fail
+      // loudly instead so the cause is visible.
+      this.localStream = await Promise.race([
+        navigator.mediaDevices.getUserMedia({ audio: true }),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  "Microphone permission was never granted. Check the microphone " +
+                    "icon in the address bar, and confirm the browser has microphone " +
+                    "access in your operating system's privacy settings."
+                )
+              ),
+            MICROPHONE_TIMEOUT_MS
+          )
+        ),
+      ]);
+      trace("microphone granted", this.localStream.getAudioTracks().map((t) => t.label));
 
       const pc = new RTCPeerConnection();
       this.pc = pc;
+      pc.addEventListener("connectionstatechange", () => trace("pc.connectionState", pc.connectionState));
+      pc.addEventListener("iceconnectionstatechange", () => trace("pc.iceConnectionState", pc.iceConnectionState));
 
       for (const track of this.localStream.getTracks()) {
         pc.addTrack(track, this.localStream);
@@ -102,15 +135,19 @@ export default class LiveAgent {
       this.dc = dc;
       this.registerDataChannelListeners(dc);
 
+      trace("creating offer");
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      trace("waiting for ICE gathering");
       await this.waitForIceGatheringComplete(pc);
+      trace("ICE gathering done", pc.iceGatheringState);
 
       const localSdp = pc.localDescription?.sdp;
       if (!localSdp) {
         throw new Error("Missing local SDP after ICE gathering completed");
       }
 
+      trace("POST /api/live-session", `sdp ${localSdp.length} bytes`);
       const response = await fetch("/api/live-session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -124,6 +161,7 @@ export default class LiveAgent {
         );
       }
 
+      trace("session created, HTTP " + response.status);
       const result = await response.json();
       const answerSdp = result?.transport?.sdp;
       if (!answerSdp) {
@@ -131,11 +169,13 @@ export default class LiveAgent {
       }
 
       await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+      trace("remote description applied -- now waiting for session.started on the data channel");
 
       // Do NOT send session.start: the HTTP request above already started
       // the session. State flips to "live" once session.started arrives.
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      trace("FAILED", message);
       this.setState("error");
       this.callbacks.onError?.(message);
       await this.teardown();
@@ -206,12 +246,61 @@ export default class LiveAgent {
     });
   }
 
+  /**
+   * Push the current score to the backend as quiet context.
+   *
+   * The backend only receives the spoken transcript, so without this it has no
+   * idea what "it" refers to in "make it lower" and regenerates a melody from
+   * scratch. session.thinking.append is the documented channel for background
+   * context; it is not spoken aloud. The 500-token cap is ample for a score.
+   */
+  private sendScoreContext() {
+    if (!this.dc || this.dc.readyState !== "open" || this.state !== "live") {
+      return;
+    }
+    const abc = this.editor.getModel()?.getValue() ?? "";
+    const content = abc.trim()
+      ? `The score currently in the shared editor is:\n\n${abc}\n\nUse this exact document as the basis for any change the user asks for.`
+      : "The shared editor is currently empty. The next request starts a new score.";
+
+    trace("-> session.thinking.append (score context)", `${abc.length} chars`);
+    this.dc.send(
+      JSON.stringify({
+        type: "session.thinking.append",
+        event_id: nextEventId(),
+        delegation_id: null,
+        content,
+      })
+    );
+  }
+
+  /** Re-send score context, debounced, whenever the document changes. */
+  private scheduleScoreContext() {
+    if (this.scoreContextTimer !== undefined) {
+      clearTimeout(this.scoreContextTimer);
+    }
+    this.scoreContextTimer = setTimeout(() => {
+      this.scoreContextTimer = undefined;
+      this.sendScoreContext();
+    }, SCORE_CONTEXT_DEBOUNCE_MS);
+  }
+
   private registerDataChannelListeners(dc: RTCDataChannel) {
+    dc.addEventListener("open", () => trace("data channel OPEN"));
+    dc.addEventListener("error", (e) => trace("data channel ERROR", e));
+
     dc.addEventListener("message", (event) => {
+      try {
+        const parsed = JSON.parse(event.data);
+        trace("<- " + parsed.type, parsed.type === "error" ? parsed : undefined);
+      } catch {
+        trace("<- unparseable data channel message", event.data);
+      }
       this.handleDataChannelMessage(event.data);
     });
 
     dc.addEventListener("close", () => {
+      trace("data channel CLOSED");
       if (this.state === "live" || this.state === "connecting") {
         this.setState("idle");
       }
@@ -242,6 +331,14 @@ export default class LiveAgent {
 
     switch (message.type) {
       case "session.started":
+        // Seed the backend with the score as soon as the session is usable,
+        // and keep it in sync as the document changes.
+        setTimeout(() => this.sendScoreContext(), 0);
+        if (!this.scoreChangeHandle) {
+          this.scoreChangeHandle = this.editor
+            .getModel()
+            ?.onDidChangeContent(() => this.scheduleScoreContext());
+        }
         this.setState("live");
         return;
       case "session.closed":
@@ -344,6 +441,13 @@ export default class LiveAgent {
   }
 
   private async teardown() {
+    if (this.scoreContextTimer !== undefined) {
+      clearTimeout(this.scoreContextTimer);
+      this.scoreContextTimer = undefined;
+    }
+    this.scoreChangeHandle?.dispose();
+    this.scoreChangeHandle = undefined;
+
     if (this.dc) {
       this.dc.close();
       this.dc = undefined;
