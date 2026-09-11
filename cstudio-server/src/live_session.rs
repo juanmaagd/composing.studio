@@ -41,7 +41,12 @@ change what the listener actually hears, put a %%MIDI program line in the
 header. Values (abcjs uses zero-based General MIDI numbers):
   0 piano, 24 nylon guitar, 40 violin, 42 cello, 46 harp, 56 trumpet,
   68 oboe, 71 clarinet, 73 flute, 75 pan flute, 77 shakuhachi, 107 koto
-Omit the line to leave the current instrument alone.
+A V: name= label is printed on the page and changes nothing that is heard.
+Every voice meant to sound different needs its own %%MIDI program line as the
+first line inside its own V: block. When you add a voice to an existing score,
+carry the other voices' program lines across unchanged -- dropping one leaves
+that voice on piano while its label still claims otherwise, and nothing warns
+anybody. Omit the line only to leave an instrument as it already is.
 
 ## Never pass an invention off as the requested work
 The worst answer you can give is your own composition under someone else's
