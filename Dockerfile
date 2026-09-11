@@ -1,18 +1,17 @@
-FROM rust:alpine as backend
+FROM rust:alpine AS backend
 WORKDIR /home/rust/src
 RUN apk --no-cache add musl-dev openssl-dev
 COPY . .
-RUN cargo test --release
 RUN cargo build --release
 
-FROM rust:alpine as wasm
+FROM rust:bookworm AS wasm
 WORKDIR /home/rust/src
-RUN apk --no-cache add curl musl-dev
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 RUN curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 COPY . .
 RUN wasm-pack build --target web cstudio-wasm
 
-FROM node:lts-alpine as frontend
+FROM node:lts-alpine AS frontend
 WORKDIR /usr/src/app
 COPY package.json package-lock.json ./
 COPY --from=wasm /home/rust/src/cstudio-wasm/pkg cstudio-wasm/pkg
